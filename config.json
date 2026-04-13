@@ -1,0 +1,15 @@
+{
+  "readOnly": true,
+  "allowedLeadingKeywords": ["SELECT", "EXPLAIN", "WITH", "SHOW"],
+  "forbiddenKeywords": [
+    "INSERT", "UPDATE", "DELETE", "DROP", "ALTER", "TRUNCATE",
+    "CREATE", "GRANT", "REVOKE", "COPY", "VACUUM", "REINDEX",
+    "CLUSTER", "MERGE", "CALL"
+  ],
+  "wrapInReadOnlyTx": true,
+  "statementTimeoutMs": 10000,
+  "defaultLimit": 100,
+  "maxRows": 1000,
+  "cellMaxLength": 80,
+  "targets": {}
+}
