@@ -12,10 +12,16 @@ test('repeated --sql and --file keep their order', () => {
 });
 
 test('new flags', () => {
-  const a = parseArgs(['--target', 'dev', '--accept-host-key', 'SHA256:abc', '--close-tunnel', '--verbose']);
+  const a = parseArgs(['--target', 'dev', '--accept-host-key', 'SHA256:abc', '--verbose']);
   assert.equal(a.acceptHostKey, 'SHA256:abc');
-  assert.equal(a.closeTunnel, true);
   assert.equal(a.verbose, true);
+  assert.equal(parseArgs(['--target', 'dev', '--close-tunnel']).closeTunnel, true);
+});
+
+test('one action per call', () => {
+  assert.throws(() => parseArgs(['--target', 'dev', '--list-tables', '--sql', 'SELECT 1']), /--list-tables and --sql\/--file/);
+  assert.throws(() => parseArgs(['--target', 'dev', '--describe', 'users', '--close-tunnel']), UsageError);
+  assert.doesNotThrow(() => parseArgs(['--target', 'dev', '--sql', 'SELECT 1', '--file', 'q.sql']));
 });
 
 test('bad values are usage errors', () => {

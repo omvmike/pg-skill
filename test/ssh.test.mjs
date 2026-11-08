@@ -11,7 +11,7 @@ const CFG = { controlPersistSeconds: 600, connectTimeoutSeconds: 10, serverAlive
 const SSH = { host: '203.0.113.10', user: 'ec2-user', port: null, key: '/keys/bastion.pem', reuse: true };
 
 test('ssh args: forward to the DB, non-interactive, shared connection, key', () => {
-  const { args, controlPath: cp } = buildSshArgs(SSH, 'db.internal', 5432, CFG, { tmpdir: '/tmp' });
+  const { args, controlPath: cp } = buildSshArgs(SSH, 'db.internal', 5432, CFG, { dir: '/home/u/.ssh' });
   assert.deepEqual(args.slice(0, 2), ['-W', 'db.internal:5432']);
   assert.ok(args.includes('BatchMode=yes'));
   assert.ok(args.includes('ConnectTimeout=10'));
@@ -121,4 +121,12 @@ test('hashed known_hosts entries are found by ssh-keygen -F', async () => {
 test('bastion label', () => {
   assert.equal(bastionLabel(SSH), 'ec2-user@203.0.113.10');
   assert.equal(bastionLabel({ host: 'b', user: null, port: 2222 }), 'b:2222');
+});
+
+test('ssh args pin the log level; the shared socket lives in ~/.ssh', async () => {
+  const { args } = buildSshArgs(SSH, 'db', 5432, CFG);
+  assert.ok(args.includes('LogLevel=ERROR'));
+  assert.equal(path.dirname(controlPath(SSH)), path.join(os.homedir(), '.ssh'));
+  const { SSH_ENV } = await import('../lib/ssh.mjs');
+  assert.equal(SSH_ENV.LC_ALL, 'C');
 });

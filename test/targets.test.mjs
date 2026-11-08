@@ -63,3 +63,19 @@ test('list labels show which targets go through a bastion', () => {
   assert.equal(describeTarget(dir, 'dev'), 'dev  (via bastion ec2-user@203.0.113.10)');
   assert.equal(describeTarget(dir, 'local'), 'local');
 });
+
+test('target names, DB_PORT and SSL flags are validated', () => {
+  const dir = fixture({
+    '.db.ok': `${BASE}DB_SSL=TRUE\nDB_SSL_REJECT_UNAUTHORIZED=false\n`,
+    '.db.badport': BASE.replace('DB_PORT=5432', 'DB_PORT=abc'),
+    '.db.badssl': `${BASE}DB_SSL=1\n`,
+    '.db.badreject': `${BASE}DB_SSL=true\nDB_SSL_REJECT_UNAUTHORIZED=no\n`,
+    '.db.Mixed': BASE,
+  });
+  assert.deepEqual(loadTarget(dir, 'ok').pgConfig.ssl, { rejectUnauthorized: false });
+  for (const name of ['badport', 'badssl', 'badreject', '../x', 'a/b']) {
+    assert.throws(() => loadTarget(dir, name), err => err.code === 'TARGET_INVALID', name);
+  }
+  assert.ok(listTargets(dir).includes('Mixed'));
+  assert.equal(loadTarget(dir, 'Mixed').name, 'Mixed');
+});

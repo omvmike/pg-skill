@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 // Live test runner. Needs a real project with `pg` installed and .db.<target> files.
 //   node test/live.mjs --project <dir> --local <target> [--remote <bastion-target>] [--baseline <old-skill-dir>]
-//        [--groups A,B,C,D,E,F,G,H] [--table users] [--unknown-host <bastion hostname not in known_hosts>]
+//        [--groups A,B,C,D,E,F,G,H,I] [--table users] [--unknown-host <bastion hostname not in known_hosts>]
 //        [--db-ok <db name>] [--db-denied <db name>] [--report <file.md>]
 import { spawn } from 'node:child_process';
 import crypto from 'node:crypto';
@@ -10,12 +10,14 @@ import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { parseEnv, loadTarget } from '../lib/targets.mjs';
-import { controlPath, checkSharedConnection, closeSharedConnection } from '../lib/ssh.mjs';
+import {
+  controlPath, checkSharedConnection, closeSharedConnection, buildSshArgs, runCommand, classifySshFailure,
+} from '../lib/ssh.mjs';
 
 const SKILL_DIR = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 
 function parseCli(argv) {
-  const o = { groups: 'A,B,C,D,E,F,G,H', table: 'users' };
+  const o = { groups: 'A,B,C,D,E,F,G,H,I', table: 'users' };
   for (let i = 0; i < argv.length; i++) {
     const key = argv[i].replace(/^--/, '').replace(/-([a-z])/g, (_, c) => c.toUpperCase());
     o[key] = argv[++i];
@@ -32,11 +34,11 @@ const opts = parseCli(process.argv.slice(2));
 const results = [];
 const sleep = ms => new Promise(r => setTimeout(r, ms));
 
-function run(args, { skillDir = SKILL_DIR, timeoutMs = 90000, env = {} } = {}) {
+function run(args, { skillDir = SKILL_DIR, timeoutMs = 90000, env = {}, cwd = opts.project } = {}) {
   return new Promise(resolve => {
     const start = Date.now();
     const child = spawn(process.execPath, [path.join(skillDir, 'bin/query.mjs'), ...args], {
-      cwd: opts.project, env: { ...process.env, ...env }, stdio: ['ignore', 'pipe', 'pipe'],
+      cwd, env: { ...process.env, ...env }, stdio: ['ignore', 'pipe', 'pipe'],
     });
     let stdout = '';
     let stderr = '';
@@ -66,6 +68,8 @@ function check(group, name, pass, actual, expected = '') {
 const normalize = s => s
   .replace(/in \d+ms/g, 'in Nms')
   .replace(/"elapsedMs": \d+/g, '"elapsedMs": N')
+  .replace(/,\n\s*"limitReached": (true|false)/g, '')
+  .replace(/ \(limit \d+ reached; more rows may exist\)/g, '')
   .replace(/ {2}\(via bastion [^)]*\)/g, '');
 
 function readTargetFile(name) {
@@ -213,6 +217,7 @@ async function groupC() {
       ['COMMIT escape', ["SELECT 1; COMMIT; SELECT current_setting('transaction_read_only')"]],
       ['END escape', ['SELECT 1; END; SELECT 2']],
       ['E-string escape', ["SELECT E'\\''; COMMIT; SELECT ''"]],
+      ['CR-terminated comment escape', ["SELECT 1 --\r; COMMIT; SELECT current_setting('transaction_read_only')"]],
     ];
     for (const [name, sqls] of rejected) {
       const r = await run(['--target', target, '--verbose', ...sqls.flatMap(s => ['--sql', s])]);
@@ -224,6 +229,32 @@ async function groupC() {
 
     const allowed = await run(['--target', target, '--sql', "SELECT 'DELETE FROM users' AS note, 1 AS \"update\""]);
     check('C', `${target}: keywords inside strings/identifiers allowed`, allowed.code === 0, `exit ${allowed.code} ${allowed.stderr.trim()}`, 'exit 0');
+
+    for (const sql of ['SELECT 1 AS a LIMIT 5 -- note', 'SHOW server_version -- note', 'EXPLAIN SELECT 1 -- note', 'SELECT 1 AS a; -- note']) {
+      const r = await run(['--target', target, '--sql', sql]);
+      check('C', `${target}: trailing comment works: ${sql}`, r.code === 0 && !/rollback/i.test(r.stdout.split('\n')[0]), `exit ${r.code} ${r.stderr.trim() || r.stdout.split('\n')[0]}`, 'exit 0');
+    }
+    const dup = await run(['--target', target, '--sql', 'SELECT 1 AS id, 2 AS id']);
+    const dupJ = await run(['--target', target, '--format', 'json', '--sql', 'SELECT 1 AS id, 2 AS id']);
+    let dupRow = null;
+    try { dupRow = JSON.parse(dupJ.stdout).rows[0]; } catch { /* reported */ }
+    check('C', `${target}: duplicate column names keep their values`, /\| 1 +\| 2 +\|/.test(dup.stdout) && dupRow && dupRow.id === 1 && dupRow.id_2 === 2,
+      `${dup.stdout.split('\n')[2]} json ${JSON.stringify(dupRow)}`, '| 1 | 2 |, {id:1,id_2:2}');
+
+    const noLexer = skillCopyWithConfig({}, { readOnly: false });
+    try {
+      const multi = await run(['--target', target, '--sql', "SELECT 1 --\r; COMMIT; SELECT current_setting('transaction_read_only')"], { skillDir: noLexer });
+      check('C', `${target}: with the lexical check off, Postgres itself refuses a second statement`, multi.code === 1 && /cannot insert multiple commands/.test(multi.stderr),
+        `exit ${multi.code} ${multi.stderr.trim()}`, 'exit 1, cannot insert multiple commands into a prepared statement');
+      const rw = await run(['--target', target, '--sql', "SELECT set_config('transaction_read_only', 'off', true)"], { skillDir: noLexer });
+      check('C', `${target}: a statement cannot switch its transaction to read-write`, rw.code === 1 && /SQLSTATE 25001/.test(rw.stderr), rw.stderr.trim(), 'exit 1, SQLSTATE 25001');
+      if (target === opts.local) {
+        const del = await run(['--target', target, '--sql', `DELETE FROM ${opts.table} WHERE false`], { skillDir: noLexer });
+        check('C', `${target}: with the lexical check off, a write fails in the read-only transaction`, del.code === 1 && /SQLSTATE 25006/.test(del.stderr), del.stderr.trim(), 'exit 1, SQLSTATE 25006');
+      }
+    } finally {
+      fs.rmSync(noLexer, { recursive: true, force: true });
+    }
 
     const seq = await run(['--target', target, '--sql', `SELECT nextval(pg_get_serial_sequence('${opts.table}', 'id'))`]);
     check('C', `${target}: nextval blocked by read-only transaction`, seq.code === 1 && /read-only transaction|SQLSTATE (25006|42501)/.test(seq.stderr),
@@ -270,8 +301,20 @@ async function groupD() {
     const single = await run(['--target', target, '--format', 'json', '--sql', 'SELECT 1 AS a']);
     let s = null;
     try { s = JSON.parse(single.stdout); } catch { /* reported */ }
-    check('D', `${target}: single --sql JSON shape unchanged`, s && JSON.stringify(Object.keys(s)) === JSON.stringify(['rows', 'rowCount', 'elapsedMs', 'target', 'truncated']),
+    check('D', `${target}: single --sql JSON shape unchanged`, s && JSON.stringify(Object.keys(s)) === JSON.stringify(['rows', 'rowCount', 'elapsedMs', 'target', 'truncated', 'limitReached']),
       s ? Object.keys(s).join(',') : single.stdout);
+
+    const dj = await run(['--target', target, '--format', 'json', '--describe', opts.table]);
+    let doc = null;
+    try { doc = JSON.parse(dj.stdout); } catch { /* reported */ }
+    check('D', `${target}: --describe --format json is one document`, dj.code === 0 && doc && doc.table === `public.${opts.table}` &&
+      Array.isArray(doc.columns) && doc.columns.length > 0 && Array.isArray(doc.indexes) && Array.isArray(doc.foreignKeys),
+      doc ? Object.keys(doc).join(',') : dj.stdout.slice(0, 120), '{target, table, columns, indexes, foreignKeys}');
+
+    const lim = await run(['--target', target, '--sql', 'SELECT g FROM generate_series(1, 200) g']);
+    const noLim = await run(['--target', target, '--sql', 'SELECT g FROM generate_series(1, 200) g', '--limit', '500']);
+    check('D', `${target}: auto LIMIT reached is reported`, /-- 100 rows .*\(limit 100 reached; more rows may exist\)/.test(lim.stdout) && !/limit \d+ reached/.test(noLim.stdout),
+      `${lim.stdout.split('\n').at(-2)} | ${noLim.stdout.split('\n').at(-2)}`);
 
     if (target === opts.remote) {
       const d = await run(['--target', target, '--verbose', '--describe', opts.table]);
@@ -281,11 +324,12 @@ async function groupD() {
 }
 
 // ---------------------------------------------------------------- E. SSH lifecycle
-function skillCopyWithConfig(patch) {
+function skillCopyWithConfig(patch, topPatch = {}) {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'pgsk-skill-'));
   fs.cpSync(SKILL_DIR, dir, { recursive: true, filter: src => !/\/(\.git|test|plans)(\/|$)/.test(src) });
   const cfgFile = path.join(dir, 'config.json');
   const cfg = JSON.parse(fs.readFileSync(cfgFile, 'utf8'));
+  Object.assign(cfg, topPatch);
   cfg.ssh = { ...cfg.ssh, ...patch };
   fs.writeFileSync(cfgFile, JSON.stringify(cfg, null, 2));
   return dir;
@@ -302,6 +346,12 @@ async function groupE() {
   check('E', 'second call reuses it and is faster', second.code === 0 && /shared SSH connection: reused/.test(second.stderr) && second.ms < first.ms,
     `${first.ms}ms → ${second.ms}ms`, 'reused, faster');
   check('E', 'the call returned while the shared connection stays alive', Boolean(await masterPid()) && !/KILLED/.test(second.stderr), `master pid ${await masterPid()}`);
+  const timed = await run(q);
+  const connectMs = Number(timed.stderr.match(/connected in (\d+)ms/)?.[1]);
+  check('E', 'no exit delay: the call ends right after the query', timed.code === 0 && timed.ms - connectMs < 1500,
+    `${timed.ms}ms total, connect ${connectMs}ms, rest ${timed.ms - connectMs}ms`, '< 1500 ms beyond connect (was ~2.4 s)');
+  const cp = controlPath(remoteSsh());
+  check('E', 'shared socket lives in ~/.ssh', cp.startsWith(path.join(os.homedir(), '.ssh') + path.sep) && fs.existsSync(cp), cp);
 
   const close1 = await run(['--target', T, '--close-tunnel']);
   const close2 = await run(['--target', T, '--close-tunnel']);
@@ -406,6 +456,23 @@ async function groupG() {
     check('G', 'accepting a fingerprint the bastion does not present is refused', wrong.code === 6 && /HOST_KEY_MISMATCH/.test(wrong.stderr), wrong.stderr.trim());
   });
   check('G', 'known_hosts untouched', hash() === before, hash() === before ? 'unchanged' : 'CHANGED');
+
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'pgsk-hk-'));
+  try {
+    await sh('ssh-keygen', ['-q', '-t', 'ed25519', '-N', '', '-f', path.join(dir, 'k')]);
+    const pub = fs.readFileSync(path.join(dir, 'k.pub'), 'utf8').trim().split(/\s+/);
+    const t = loadTarget(opts.project, opts.remote);
+    const kh = path.join(dir, 'known_hosts');
+    fs.writeFileSync(kh, `${t.ssh.host} ${pub[0]} ${pub[1]}\n`);
+    const cfg = JSON.parse(fs.readFileSync(path.join(SKILL_DIR, 'config.json'), 'utf8')).ssh;
+    const { args } = buildSshArgs(t.ssh, t.pgConfig.host, t.pgConfig.port, cfg, { reuse: false });
+    args.splice(args.length - 1, 0, '-o', `UserKnownHostsFile=${kh}`, '-o', 'GlobalKnownHostsFile=/dev/null');
+    const r = await runCommand('ssh', args, { timeoutMs: 30000 });
+    check('G', 'changed host key is detected with the skill\'s ssh options (LogLevel=ERROR, LC_ALL=C)',
+      r.code === 255 && classifySshFailure(r.stderr).kind === 'HOST_KEY_CHANGED', `exit ${r.code}: ${r.stderr.trim().split('\n')[1] || r.stderr.trim()}`);
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
 }
 
 // ---------------------------------------------------------------- H. database side
@@ -444,7 +511,47 @@ async function groupH() {
   });
 }
 
-const GROUPS = { A: groupA, B: groupB, C: groupC, D: groupD, E: groupE, F: groupF, G: groupG, H: groupH };
+// ---------------------------------------------------------------- I. connection errors and CLI
+async function groupI() {
+  const L = opts.local;
+  const fx = {
+    live_nodb: deriveTarget(L, { DB_NAME: 'no_such_db_pgsk' }),
+    live_blackhole: deriveTarget(L, { DB_HOST: '10.255.255.1' }),
+  };
+  if (opts.remote) fx.live_badpw = deriveTarget(opts.remote, { DB_PASSWORD: 'wrong-password-pgsk' });
+  await withFixtures(fx, async () => {
+    let r = await run(['--target', 'live_nodb', '--sql', 'SELECT 1']);
+    check('I', 'unknown database → exit 5 CONNECTION with SQLSTATE 3D000', r.code === 5 && /^CONNECTION: .*\(SQLSTATE 3D000\)/.test(r.stderr), `exit ${r.code} ${r.stderr.trim()}`);
+    r = await run(['--target', 'live_blackhole', '--sql', 'SELECT 1'], { timeoutMs: 60000 });
+    check('I', 'unreachable direct host → exit 5 after the connect timeout', r.code === 5 && /no answer from 10\.255\.255\.1:\d+ within 10000ms/.test(r.stderr) && r.ms < 15000,
+      `exit ${r.code} in ${r.ms}ms ${r.stderr.trim()}`, 'exit 5 in ~10 s');
+    if (opts.remote) {
+      r = await run(['--target', 'live_badpw', '--sql', 'SELECT 1']);
+      check('I', 'wrong password through the bastion → exit 5 with SQLSTATE 28P01', r.code === 5 && /^CONNECTION: .*\(SQLSTATE 28P01\)/.test(r.stderr), `exit ${r.code} ${r.stderr.trim()}`);
+    }
+  });
+
+  const bare = fs.mkdtempSync(path.join(os.tmpdir(), 'pgsk-nopg-'));
+  try {
+    fs.writeFileSync(path.join(bare, 'package.json'), '{}\n');
+    fs.writeFileSync(path.join(bare, '.db.demo'), 'DB_HOST=localhost\nDB_PORT=5432\nDB_USER=u\nDB_PASSWORD=p\nDB_NAME=d\n', { mode: 0o600 });
+    const lt = await run(['--list-targets'], { cwd: bare });
+    check('I', '--list-targets works without pg installed', lt.code === 0 && lt.stdout.trim() === 'demo', `exit ${lt.code} ${lt.stdout.trim()} ${lt.stderr.trim()}`);
+    const q = await run(['--target', 'demo', '--sql', 'SELECT 1'], { cwd: bare });
+    check('I', 'a query without pg installed → exit 5 with install hint', q.code === 5 && /cannot resolve 'pg'/.test(q.stderr), `exit ${q.code} ${q.stderr.split('\n')[0]}`);
+  } finally {
+    fs.rmSync(bare, { recursive: true, force: true });
+  }
+
+  const two = await run(['--target', L, '--list-tables', '--sql', 'SELECT 1']);
+  check('I', 'two actions in one call → usage error', two.code === 1 && /Pass one action per call/.test(two.stderr), `exit ${two.code} ${two.stderr.split('\n')[0]}`);
+  const missing = await run(['--target', 'no_such_target_xyz', '--sql', 'SELECT 1']);
+  check('I', 'missing target → exit 4, first line starts with TARGET:', missing.code === 4 && /^TARGET: /.test(missing.stderr), missing.stderr.split('\n')[0]);
+  const trav = await run(['--target', '../x', '--sql', 'SELECT 1']);
+  check('I', 'target name with a path is refused', trav.code === 4 && /^TARGET: /.test(trav.stderr), trav.stderr.split('\n')[0]);
+}
+
+const GROUPS = { A: groupA, B: groupB, C: groupC, D: groupD, E: groupE, F: groupF, G: groupG, H: groupH, I: groupI };
 const NEEDS_REMOTE = new Set(['E', 'F', 'G', 'H']);
 for (const [g, fn] of Object.entries(GROUPS)) {
   if (!opts.groups.has(g)) continue;
