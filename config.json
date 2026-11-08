@@ -11,5 +11,12 @@
   "defaultLimit": 100,
   "maxRows": 1000,
   "cellMaxLength": 80,
+  "ssh": {
+    "controlPersistSeconds": 600,
+    "connectTimeoutSeconds": 10,
+    "serverAliveIntervalSeconds": 5,
+    "serverAliveCountMax": 2,
+    "pgConnectTimeoutMs": 20000
+  },
   "targets": {}
 }

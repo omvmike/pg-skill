@@ -3,3 +3,7 @@ node_modules/
 .idea/
 .vscode/
 *.log
+
+# Local-only: plans and evals reference a private environment
+plans/
+evals/
