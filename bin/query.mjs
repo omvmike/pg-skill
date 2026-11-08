@@ -4,9 +4,10 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { createRequire } from 'node:module';
 import { findProjectRoot, listTargets, loadTarget, bootstrapFromEnv, describeTarget } from '../lib/targets.mjs';
-import { validate, buildExecutionSql, SafetyError } from '../lib/safety.mjs';
+import { validate, buildExecution, SafetyError } from '../lib/safety.mjs';
 import {
-  formatTable, formatJson, formatJsonBatch, formatSqlError, summaryLine, batchHeader, batchFooter, stoppedLine,
+  formatTable, formatJson, formatJsonDocument, formatSqlError, summaryLine, batchHeader, batchFooter, stoppedLine,
+  rowsToObjects,
 } from '../lib/format.mjs';
 import {
   createSshTunnel, SshError, describeHostKeyFailure, acceptHostKey, closeSharedConnection, bastionLabel,
@@ -26,25 +27,47 @@ const SSH_CONFIG = {
   ...(CONFIG.ssh || {}),
 };
 
-const requireFromProject = createRequire(path.join(PROJECT_ROOT, 'package.json'));
-let pg;
-try {
-  pg = requireFromProject('pg');
-} catch (err) {
-  process.stderr.write(
-    `Cannot resolve 'pg' from your project (${PROJECT_ROOT}).\n` +
-    `Install it with: npm install pg  (or: yarn add pg)\n` +
-    `Original error: ${err.message}\n`
-  );
-  process.exit(5);
-}
-const { Client } = pg;
-
+const CONNECT_TIMEOUT_MS = CONFIG.connectTimeoutMs ?? 10000;
 const RAW_TEXT_OIDS = new Set([1082, 1114, 1115, 1182]);
-const TYPES = {
-  getTypeParser: (oid, format) =>
-    RAW_TEXT_OIDS.has(oid) && (format || 'text') === 'text' ? (v => v) : pg.types.getTypeParser(oid, format),
-};
+
+let pgRuntime = null;
+function loadPg() {
+  if (pgRuntime) return pgRuntime;
+  let pg;
+  try {
+    pg = createRequire(path.join(PROJECT_ROOT, 'package.json'))('pg');
+  } catch (err) {
+    die(5,
+      `CONNECTION: cannot resolve 'pg' from your project (${PROJECT_ROOT}).\n` +
+      `Install it with: npm install pg  (or: yarn add pg)\n` +
+      `Original error: ${err.message}`);
+  }
+  pgRuntime = {
+    Client: pg.Client,
+    types: {
+      getTypeParser: (oid, format) =>
+        RAW_TEXT_OIDS.has(oid) && (format || 'text') === 'text' ? (v => v) : pg.types.getTypeParser(oid, format),
+    },
+  };
+  return pgRuntime;
+}
+
+class ConnectionError extends Error {
+  constructor(message, cause) {
+    super(message);
+    this.code = 'CONNECTION';
+    this.sqlState = cause && /^[0-9A-Z]{5}$/.test(cause.code || '') ? cause.code : null;
+    this.cause = cause;
+  }
+}
+
+function connectionError(err, host, port, timeoutMs) {
+  if (err instanceof SshError || err instanceof ConnectionError) return err;
+  if (/timeout expired/i.test((err && err.message) || '')) {
+    return new ConnectionError(`no answer from ${host}:${port} within ${timeoutMs}ms`, err);
+  }
+  return new ConnectionError((err && err.message) || String(err), err);
+}
 
 const USAGE = `Usage:
   node <SKILL>/bin/query.mjs --list-targets
@@ -70,7 +93,7 @@ Options:
 
 Several --sql flags run in order on one connection and stop at the first failing query.
 
-Exit codes: 0=ok, 1=usage or SQL error, 2=safety, 3=timeout, 4=target missing/invalid, 5=connection, 6=SSH tunnel`;
+Exit codes: 0=ok, 1=usage or SQL error, 2=safety, 3=timeout, 4=target missing/invalid, 5=connection (incl. login), 6=SSH tunnel`;
 
 const ctx = { target: null, verbose: false };
 
@@ -101,7 +124,7 @@ function formatSshError(err) {
           '  reject: stop; do not connect.',
         );
       } else {
-        lines.push("Could not read the bastion's host key to show its fingerprint. Ask the user to connect once with ssh themselves and verify the key.");
+        lines.push("No fingerprint to show. Ask the user to connect once with ssh themselves and verify the bastion's key; do not accept it yourself.");
       }
       return lines.join('\n');
     }
@@ -133,6 +156,7 @@ function exitCodeFor(err) {
   if (err instanceof UsageError) return 1;
   if (err instanceof SafetyError) return 2;
   if (err instanceof SshError) return 6;
+  if (err instanceof ConnectionError) return 5;
   if (err && ['TARGET_MISSING', 'TARGET_INVALID', 'NO_ENV'].includes(err.code)) return 4;
   if (err && (err.code === '57014' || /statement timeout/i.test(err.message || ''))) return 3;
   if (err && ['ECONNREFUSED', 'ENOTFOUND', 'ETIMEDOUT', 'EHOSTUNREACH', 'ECONNRESET'].includes(err.code)) return 5;
@@ -143,8 +167,9 @@ function describeError(err) {
   if (err instanceof UsageError) return `${err.message}\n\n${USAGE}`;
   if (err instanceof SafetyError) return `SAFETY: ${err.message}`;
   if (err instanceof SshError) return formatSshError(err);
+  if (err instanceof ConnectionError) return `CONNECTION: ${err.message}${err.sqlState ? ` (SQLSTATE ${err.sqlState})` : ''}`;
   const code = exitCodeFor(err);
-  if (code === 4) return err.message;
+  if (code === 4) return `TARGET: ${err.message}`;
   if (code === 3) return `TIMEOUT: query exceeded ${CONFIG.statementTimeoutMs}ms`;
   if (code === 5) return `CONNECTION: ${err.message}`;
   if (err && err.severity) return formatSqlError(err);
@@ -156,12 +181,17 @@ function exitForError(err) {
 }
 
 async function openClient(target) {
+  const { Client } = loadPg();
   const base = { ...target.pgConfig };
   if (!target.ssh) {
-    const client = new Client(base);
+    const client = new Client({ ...base, connectionTimeoutMillis: CONNECT_TIMEOUT_MS });
     client.on('error', () => {});
     const start = Date.now();
-    await client.connect();
+    try {
+      await client.connect();
+    } catch (err) {
+      throw connectionError(err, base.host, base.port, CONNECT_TIMEOUT_MS);
+    }
     return { client, tunnel: null, shared: null, connectMs: Date.now() - start };
   }
 
@@ -190,7 +220,7 @@ async function openClient(target) {
       if (explained instanceof SshError && explained.retryable && sharedExisted) {
         await closeSharedConnection(target.ssh, { timeoutMs: 3000 }).catch(() => {});
       }
-      throw explained;
+      throw connectionError(explained, base.host, base.port, SSH_CONFIG.pgConnectTimeoutMs);
     }
     const shared = !tunnel.state.controlPath ? 'off' : sharedExisted ? 'reused' : 'opened';
     return { client, tunnel, shared, connectMs: Date.now() - start };
@@ -208,21 +238,15 @@ async function openClient(target) {
   return result;
 }
 
-function pickSelectResult(result) {
-  if (Array.isArray(result)) {
-    for (let i = result.length - 1; i >= 0; i--) {
-      if (result[i] && Array.isArray(result[i].rows) && result[i].fields && result[i].fields.length) {
-        return result[i];
-      }
-    }
-    return result[result.length - 1] || { rows: [], fields: [] };
-  }
-  return result;
-}
-
 async function closeConnection(conn) {
   if (!conn) return;
-  await conn.client.end().catch(() => {});
+  let timer;
+  const ended = await Promise.race([
+    conn.client.end().then(() => true, () => true),
+    new Promise(resolve => { timer = setTimeout(() => resolve(false), 2000); }),
+  ]);
+  clearTimeout(timer);
+  if (!ended) conn.client.connection?.stream?.destroy?.();
   if (conn.tunnel) await conn.tunnel.settled(2000);
 }
 
@@ -248,6 +272,7 @@ function validateAll(items) {
 
 async function runItems(target, items, args, mode) {
   validateAll(items);
+  const { types } = loadPg();
   let conn;
   try {
     conn = await openClient(target);
@@ -255,61 +280,70 @@ async function runItems(target, items, args, mode) {
     exitForError(err);
   }
 
+  const json = args.format === 'json';
   const total = items.length;
   const jsonResults = [];
+  const describeDoc = mode === 'describe' && json ? { target: target.name, table: items[0].table } : null;
   let failure = null;
 
   for (let idx = 0; idx < total; idx++) {
     const item = items[idx];
-    const { sql, finalUserSql } = buildExecutionSql(item.sql, CONFIG, {
+    const exec = buildExecution(item.sql, CONFIG, {
       autoLimit: item.autoLimit ?? args.autoLimit,
       limitOverride: args.limit ?? null,
     });
-    if (mode === 'batch' && args.format !== 'json') {
+    if (mode === 'batch' && !json) {
       if (idx > 0) process.stdout.write('\n');
       process.stdout.write(batchHeader(idx + 1, total) + '\n');
     }
-    if (item.heading) process.stdout.write(item.heading + '\n');
+    if (item.heading && !json) process.stdout.write(item.heading + '\n');
 
-    const start = Date.now();
     let raw;
+    let elapsedMs;
     try {
-      raw = await conn.client.query({ text: sql, types: TYPES });
+      if (exec.prelude) await conn.client.query(idx === 0 ? exec.prelude : `ROLLBACK; ${exec.prelude}`);
+      const start = Date.now();
+      raw = await conn.client.query({ text: exec.userSql, types, rowMode: 'array', queryMode: 'extended' });
+      elapsedMs = Date.now() - start;
     } catch (err) {
-      failure = { index: idx + 1, error: translateRuntimeError(err, conn), finalUserSql };
+      failure = { index: idx + 1, error: translateRuntimeError(err, conn), userSql: exec.userSql };
       break;
     }
-    const elapsedMs = Date.now() - start;
-    const result = pickSelectResult(raw);
-    let rows = result.rows || [];
+    const fields = raw.fields || [];
+    let rows = raw.rows || [];
+    const limitReached = exec.autoLimit !== null && rows.length >= exec.autoLimit;
     let truncated = false;
     if (rows.length > CONFIG.maxRows) {
       rows = rows.slice(0, CONFIG.maxRows);
       truncated = true;
     }
-    const meta = { rowCount: rows.length, elapsedMs, target: target.name, truncated };
-    if (args.format === 'json') {
-      if (mode === 'batch') jsonResults.push({ query: idx + 1, sql: finalUserSql, rowCount: rows.length, elapsedMs, truncated, rows });
-      else process.stdout.write(formatJson(rows, meta) + '\n');
+    const meta = { rowCount: rows.length, elapsedMs, target: target.name, truncated, limitReached };
+    if (json) {
+      const objects = rowsToObjects(rows, fields);
+      if (describeDoc) describeDoc[item.key] = objects;
+      else if (mode === 'batch') jsonResults.push({ query: idx + 1, sql: exec.userSql, rowCount: rows.length, elapsedMs, truncated, limitReached, rows: objects });
+      else process.stdout.write(formatJson(objects, meta) + '\n');
     } else {
-      process.stdout.write(formatTable(rows, result.fields, { cellMaxLength: CONFIG.cellMaxLength }) + '\n');
-      process.stdout.write(summaryLine({ ...meta, finalSql: finalUserSql }) + '\n');
+      process.stdout.write(formatTable(rows, fields, { cellMaxLength: CONFIG.cellMaxLength }) + '\n');
+      process.stdout.write(summaryLine({ ...meta, autoLimit: exec.autoLimit, finalSql: exec.userSql }) + '\n');
     }
   }
 
   await closeConnection(conn);
 
-  if (mode === 'batch' && args.format === 'json') {
+  if (describeDoc && !failure) process.stdout.write(formatJsonDocument(describeDoc) + '\n');
+
+  if (mode === 'batch' && json) {
     const batch = { target: target.name, results: jsonResults };
     if (failure) {
       batch.results.push({
         query: failure.index,
-        sql: failure.finalUserSql,
+        sql: failure.userSql,
         error: { message: failure.error.message, code: failure.error.code || null },
       });
       batch.stoppedAt = failure.index;
     }
-    process.stdout.write(formatJsonBatch(batch) + '\n');
+    process.stdout.write(formatJsonDocument(batch) + '\n');
   }
 
   if (failure) {
@@ -323,7 +357,7 @@ async function runItems(target, items, args, mode) {
     return;
   }
 
-  if (mode === 'batch' && args.format !== 'json') {
+  if (mode === 'batch' && !json) {
     process.stdout.write('\n' + batchFooter({
       total,
       target: target.name,
@@ -349,8 +383,11 @@ function listTablesItems() {
 function describeItems(ident) {
   const [schema, name] = ident.includes('.') ? ident.split('.', 2) : ['public', ident];
   const safe = (s) => `'${String(s).replace(/'/g, "''")}'`;
+  const table = `${schema}.${name}`;
   return [
     {
+      key: 'columns',
+      table,
       heading: `# ${schema}.${name} — columns`,
       sql: `
     SELECT column_name, data_type, is_nullable, column_default,
@@ -361,6 +398,7 @@ function describeItems(ident) {
       autoLimit: false,
     },
     {
+      key: 'indexes',
       heading: `\n# ${schema}.${name} — indexes`,
       sql: `
     SELECT indexname, indexdef
@@ -370,6 +408,7 @@ function describeItems(ident) {
       autoLimit: false,
     },
     {
+      key: 'foreignKeys',
       heading: `\n# ${schema}.${name} — foreign keys`,
       sql: `
     SELECT c.conname  AS constraint_name,

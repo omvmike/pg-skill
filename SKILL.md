@@ -13,7 +13,7 @@ All access goes through `bin/query.mjs` in this skill's directory, which:
 
 - enforces read-only access (allowed leading keywords: SELECT / EXPLAIN / WITH / SHOW), one statement per `--sql`
 - rejects forbidden keywords (INSERT, UPDATE, DELETE, DROP, ALTER, TRUNCATE, CREATE, GRANT, REVOKE, COPY, VACUUM, REINDEX, CLUSTER, MERGE, CALL)
-- wraps every query in `BEGIN TRANSACTION READ ONLY; SET LOCAL statement_timeout = ...; <query>; ROLLBACK;`
+- runs every query inside `BEGIN TRANSACTION READ ONLY` with `SET LOCAL statement_timeout`, and sends the query itself on its own so Postgres accepts exactly one statement
 - auto-appends `LIMIT` to bare SELECTs
 - connects through an SSH bastion when the target says so, and reuses that SSH connection for 10 minutes
 - formats output as a markdown table (default) or JSON (`--format json`)
@@ -74,7 +74,9 @@ DB_NAME=...
 DB_SSL=true                        # optional
 DB_SSL_REJECT_UNAUTHORIZED=false   # optional, for self-signed certs
 ```
-Comments must be on their own line: text after a value, even after `#`, becomes part of the value (passwords may contain `#`).
+Comments must be on their own line: text after a value, even after `#`, becomes part of the value (passwords may contain `#`). `DB_SSL` / `DB_SSL_REJECT_UNAUTHORIZED` take `true` or `false`.
+
+Recommend a read-only database role for every target (no superuser, no `pg_signal_backend`, no `dblink`): the read-only transaction blocks writes, but not functions that act outside it, such as `pg_terminate_backend`.
 
 ### 3. Inspect schema before writing SQL
 
@@ -85,7 +87,7 @@ node <SKILL>/bin/query.mjs --target <name> --list-tables
 node <SKILL>/bin/query.mjs --target <name> --describe <table>
 ```
 
-`--describe` accepts `schema.table` (default schema `public`) and outputs columns, indexes, and foreign keys.
+`--describe` accepts `schema.table` (default schema `public`) and outputs columns, indexes, and foreign keys. With `--format json` it prints one document: `{ target, table, columns, indexes, foreignKeys }`.
 
 ### 4. Query
 
@@ -116,6 +118,10 @@ Optional flags:
 
 Values of type `date` and `timestamp` (without time zone) print exactly as the server stores them (`2026-11-02`); `timestamptz` prints as UTC ISO.
 
+When the automatic LIMIT was hit, the summary line says `(limit 100 reached; more rows may exist)` (JSON: `"limitReached": true`) — narrow the query, aggregate, or pass `--limit N` before drawing conclusions from the row count. In JSON, a repeated column name gets a suffix (`id`, `id_2`).
+
+Pass one action per call (`--sql`/`--file`, `--describe`, `--list-tables`, ...); mixing them is a usage error.
+
 ## Targets behind an SSH bastion
 
 A target whose file contains `DB_SSH_HOST` is reached through that bastion. The skill runs the system `ssh` client for you, so do not open your own tunnel (`ssh -L`, `psql`) for such a target — that would skip the read-only checks. Extra keys:
@@ -130,7 +136,7 @@ DB_SSH_PORT=22                  # optional
 DB_SSH_REUSE=false              # optional: don't keep a shared SSH connection
 ```
 
-The first call opens the SSH connection (a few seconds); later calls within 10 minutes reuse it and are faster, so batching several `--sql` in one call still saves time. To close it right away: `node <SKILL>/bin/query.mjs --target <name> --close-tunnel`.
+The first call opens the SSH connection (a few seconds); later calls within 10 minutes reuse it and are faster, so batching several `--sql` in one call still saves time. Its control socket lives in `~/.ssh/pgsk-<hash>`. To close it right away: `node <SKILL>/bin/query.mjs --target <name> --close-tunnel`.
 
 ### When a bastion call exits with code 6
 
@@ -147,7 +153,7 @@ The first stderr line is `SSH <KIND>: ...`. What to do:
 | `DB_UNREACHABLE` | the bastion could not reach `DB_HOST:DB_PORT` | Tell the user to check those values. |
 | `TUNNEL_FAILED` / `SSH_NOT_FOUND` | anything else / no `ssh` in PATH | Relay the message. |
 
-**Unknown host key — always ask, never accept on your own.** The message shows the key type and fingerprint and the exact accept command. Ask the user with your question tool if you have one (two options: **Accept** — adds this key to their known_hosts and retries; **Reject** — stop), otherwise ask in plain text and stop until they answer. Include the target, the bastion and the fingerprint in the question. On Accept run the printed command:
+**Unknown host key — always ask, never accept on your own.** The message shows the key type and fingerprint and the exact accept command. If it shows no fingerprint (e.g. the bastion is reached through `ProxyJump`), tell the user to connect once with `ssh` themselves and verify the key; there is nothing to accept through the skill. Ask the user with your question tool if you have one (two options: **Accept** — adds this key to their known_hosts and retries; **Reject** — stop), otherwise ask in plain text and stop until they answer. Include the target, the bastion and the fingerprint in the question. On Accept run the printed command:
 
 ```bash
 node <SKILL>/bin/query.mjs --target <name> --accept-host-key SHA256:...
@@ -165,8 +171,8 @@ Branch on these in your reasoning:
 | 1 | Usage error, or the SQL itself failed (`ERROR: ... (SQLSTATE ...)`) |
 | 2 | Safety violation — query rejected (do NOT try to bypass) |
 | 3 | Statement timeout exceeded |
-| 4 | Target file missing or invalid (incl. a `DB_SSH_KEY` that doesn't exist) |
-| 5 | Connection error |
+| 4 | Target file missing or invalid (incl. a `DB_SSH_KEY` that doesn't exist); first line `TARGET: ...` |
+| 5 | Connection error, incl. wrong password or unknown database; first line `CONNECTION: ... (SQLSTATE ...)` — report it, don't rewrite the SQL |
 | 6 | SSH tunnel error — see the table above |
 
 When you hit code 2, the user asked for something the skill is designed to refuse. Tell the user what was rejected and suggest the proper path (migration, seed, or running it manually outside the skill). If it was rejected only for holding two statements, split them into separate `--sql` flags.
@@ -177,6 +183,7 @@ When you hit code 2, the user asked for something the skill is designed to refus
 
 - `allowedLeadingKeywords` / `forbiddenKeywords` — statement allowlist/denylist
 - `statementTimeoutMs` — hard cap (default 10s)
+- `connectTimeoutMs` — connect timeout for targets without a bastion (default 10s)
 - `defaultLimit` — auto-LIMIT value (default 100)
 - `maxRows` — post-query truncation cap (default 1000)
 - `cellMaxLength` — table cell truncation (default 80 chars)

@@ -26,8 +26,25 @@ test('SQL errors print message, SQLSTATE and hint', () => {
 });
 
 test('JSON output renders bytea as hex and dates as ISO', async () => {
-  const { formatJson, formatJsonBatch } = await import('../lib/format.mjs');
+  const { formatJson, formatJsonDocument } = await import('../lib/format.mjs');
   const row = { bytes: Buffer.from([0, 255]), at: new Date('2026-11-02T10:30:00Z') };
   assert.deepEqual(JSON.parse(formatJson([row], {})).rows[0], { bytes: '\\x00ff', at: '2026-11-02T10:30:00.000Z' });
-  assert.deepEqual(JSON.parse(formatJsonBatch({ results: [{ rows: [row] }] })).results[0].rows[0].bytes, '\\x00ff');
+  assert.deepEqual(JSON.parse(formatJsonDocument({ results: [{ rows: [row] }] })).results[0].rows[0].bytes, '\\x00ff');
+});
+
+test('duplicate column names keep their own values', async () => {
+  const { formatTable, rowsToObjects, columnNames } = await import('../lib/format.mjs');
+  const fields = [{ name: 'id' }, { name: 'id' }, { name: 'name' }];
+  const rows = [[1, 2, 'a|b\nc']];
+  assert.equal(formatTable(rows, fields), '| id | id | name   |\n| -- | -- | ------ |\n| 1  | 2  | a\\|b c |');
+  assert.deepEqual(columnNames(fields), ['id', 'id_2', 'name']);
+  assert.deepEqual(rowsToObjects(rows, fields), [{ id: 1, id_2: 2, name: 'a|b\nc' }]);
+});
+
+test('long bytea cells are cut at the cell width, and limit reached is reported', async () => {
+  const { formatTable, summaryLine } = await import('../lib/format.mjs');
+  const out = formatTable([[Buffer.alloc(100)]], [{ name: 'b' }], { cellMaxLength: 10 });
+  assert.match(out, /\| \\x0000000… \|$/);
+  assert.equal(summaryLine({ rowCount: 100, elapsedMs: 5, target: 'dev', limitReached: true, autoLimit: 100 }),
+    '-- 100 rows in 5ms from target=dev (limit 100 reached; more rows may exist)');
 });

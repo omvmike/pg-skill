@@ -9,7 +9,7 @@ Drop-in replacement for the `postgres` MCP server, but safer: every query is val
 - Single Node CLI: `bin/query.mjs`
 - Target selection via `.db.<name>` files at your project root (KEY=VALUE, same format as `.env`)
 - Auto-discovers any `.db.*` file as a target — drop in `.db.stage` and it shows up
-- Enforces read-only via: leading-keyword allowlist + forbidden-keyword denylist + one statement per query + `BEGIN TRANSACTION READ ONLY` wrap + server-side statement timeout
+- Enforces read-only via: leading-keyword allowlist + forbidden-keyword denylist + `BEGIN TRANSACTION READ ONLY` + server-side statement timeout. The query is sent on its own in Postgres's extended protocol, so Postgres itself refuses a second statement (no `; COMMIT; ...` escape, however it is hidden)
 - Reaches databases behind an SSH bastion by itself (system `ssh`, no local port opened), reusing the SSH connection for 10 minutes
 - Several queries per call on one connection (`--sql` repeated)
 - Markdown table output by default, JSON with `--format json`
@@ -84,7 +84,9 @@ DB_SSL=true
 DB_SSL_REJECT_UNAUTHORIZED=false
 ```
 
-Add `.db.*` to your project's `.gitignore` so credentials never get committed. Keep comments on their own line — text after a value (even after `#`) is part of the value, so passwords may contain `#`.
+Add `.db.*` to your project's `.gitignore` so credentials never get committed. Keep comments on their own line — text after a value (even after `#`) is part of the value, so passwords may contain `#`. `DB_SSL` / `DB_SSL_REJECT_UNAUTHORIZED` take `true` or `false`; anything else is rejected.
+
+Use a read-only database role (no superuser, no `pg_signal_backend`, no `dblink`). The read-only transaction stops writes, but some functions act outside it — `pg_terminate_backend`, `pg_cancel_backend`, `dblink_exec`, session advisory locks — and only the role's privileges stop those.
 
 ### Databases behind an SSH bastion
 
@@ -106,7 +108,7 @@ DB_SSH_PORT=22                    # optional
 DB_SSH_REUSE=false                # optional: no shared SSH connection
 ```
 
-How it works: for each call the skill runs `ssh -W <DB_HOST>:<DB_PORT> <bastion>` and uses that process's stdin/stdout as the database socket — TLS to the database still runs end to end. No local port is opened. With reuse on (default), OpenSSH keeps one shared connection open (`ControlMaster`/`ControlPersist`, socket in your temp dir) for 10 minutes after the last call, so later calls skip the SSH login (roughly 4 s → 2 s per call over a transatlantic link). `--close-tunnel` closes it immediately.
+How it works: for each call the skill runs `ssh -W <DB_HOST>:<DB_PORT> <bastion>` and uses that process's stdin/stdout as the database socket — TLS to the database still runs end to end. No local port is opened. With reuse on (default), OpenSSH keeps one shared connection open (`ControlMaster`/`ControlPersist`, socket `~/.ssh/pgsk-<hash>`, a directory other users can't write) for 10 minutes after the last call, so later calls skip the SSH login (roughly 4 s → 2 s per call over a transatlantic link). `--close-tunnel` closes it immediately.
 
 ssh always runs with `BatchMode=yes`, so it never waits for a prompt. If the bastion's host key isn't in your `known_hosts` yet, the call stops with exit 6 `HOST_KEY_UNKNOWN` and prints the fingerprint; after checking it, accept with:
 
@@ -157,8 +159,9 @@ node ~/.claude/skills/postgres/bin/query.mjs --target staging --close-tunnel
 |-----|---------|-------|
 | `allowedLeadingKeywords` | SELECT, EXPLAIN, WITH, SHOW | First keyword must match |
 | `forbiddenKeywords` | INSERT, UPDATE, DELETE, DROP, ALTER, TRUNCATE, CREATE, GRANT, REVOKE, COPY, VACUUM, REINDEX, CLUSTER, MERGE, CALL | Any occurrence outside strings/comments rejects |
-| `wrapInReadOnlyTx` | true | Wrap query in `BEGIN TRANSACTION READ ONLY; ...; ROLLBACK;` |
+| `wrapInReadOnlyTx` | true | Run each query inside `BEGIN TRANSACTION READ ONLY` + `SET LOCAL statement_timeout` |
 | `statementTimeoutMs` | 10000 | Hard server-side timeout |
+| `connectTimeoutMs` | 10000 | Connect timeout for targets without a bastion |
 | `defaultLimit` | 100 | Auto-appended to bare SELECTs |
 | `maxRows` | 1000 | Post-query truncation |
 | `cellMaxLength` | 80 | Table cell truncation (use `--format json` for full values) |
@@ -175,8 +178,8 @@ node ~/.claude/skills/postgres/bin/query.mjs --target staging --close-tunnel
 | 1 | Usage error, or the SQL failed (`ERROR: … (SQLSTATE …)`) |
 | 2 | Safety violation |
 | 3 | Statement timeout |
-| 4 | Target file missing or invalid |
-| 5 | Connection error (or `pg` not installed) |
+| 4 | Target file missing or invalid (`TARGET: …`) |
+| 5 | Connection error — unreachable, wrong password, unknown database, or `pg` not installed (`CONNECTION: …`) |
 | 6 | SSH tunnel error (`SSH <KIND>: …` — host key unknown/changed, auth failed, bastion or DB unreachable) |
 
 ## How project root is detected
@@ -193,6 +196,9 @@ node --test 'test/*.test.mjs'
 node test/live.mjs --project <dir> --local <target> [--remote <bastion-target>] \
   [--baseline <previous skill checkout>] [--unknown-host <bastion name not in known_hosts>] \
   [--db-ok <db>] [--db-denied <db>] [--report report.md]
+
+# wall-clock benchmark of whole CLI calls (read-only)
+node test/bench.mjs --project <dir> --remote <bastion-target> --local <target> --runs 20 --out bench.json
 ```
 
 ## License

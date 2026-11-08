@@ -8,6 +8,7 @@
   ],
   "wrapInReadOnlyTx": true,
   "statementTimeoutMs": 10000,
+  "connectTimeoutMs": 10000,
   "defaultLimit": 100,
   "maxRows": 1000,
   "cellMaxLength": 80,

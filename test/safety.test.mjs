@@ -1,6 +1,8 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { validate, stripStringsAndComments, isSingleStatement, SafetyError, buildExecutionSql } from '../lib/safety.mjs';
+import {
+  validate, stripStringsAndComments, isSingleStatement, SafetyError, buildExecution, removeTrailingSemicolon, applyAutoLimit,
+} from '../lib/safety.mjs';
 
 const CONFIG = JSON.parse(await import('node:fs').then(fs => fs.readFileSync(new URL('../config.json', import.meta.url), 'utf8')));
 
@@ -66,9 +68,42 @@ test('dollar signs inside identifiers are not dollar quotes', () => {
   assert.equal(isSingleStatement(stripStringsAndComments('SELECT a$b$; SELECT 1')), false);
 });
 
-test('buildExecutionSql wraps in a read-only transaction with a timeout', () => {
-  const { sql, finalUserSql } = buildExecutionSql('SELECT 1;', CONFIG);
-  assert.equal(finalUserSql, 'SELECT 1\nLIMIT 100');
-  assert.match(sql, /^BEGIN TRANSACTION READ ONLY;\nSET LOCAL statement_timeout = 10000;/);
-  assert.match(sql, /ROLLBACK;$/);
+test('a carriage return ends a -- comment, as in Postgres', () => {
+  rejected("SELECT 1 --\r; COMMIT; SELECT current_setting('transaction_read_only')", /one statement/);
+  rejected('SELECT 1 --\r; COMMIT; DELETE FROM users WHERE false');
+  ok('SELECT 1 -- note\r\n AS x');
+});
+
+test('stripping keeps every character position', () => {
+  for (const sql of [
+    "SELECT 'a;b', E'\\'', \"x\"\"y\", $t$z$t$ /* c /* d */ */ -- e\r\nFROM t",
+    "SELECT 'unterminated",
+    'SELECT 1 /* unterminated',
+    'SELECT $$unterminated',
+  ]) {
+    assert.equal(stripStringsAndComments(sql).length, sql.length, sql);
+  }
+});
+
+test('trailing semicolon is removed even before a trailing comment', () => {
+  assert.equal(removeTrailingSemicolon('SELECT 1;'), 'SELECT 1');
+  assert.equal(removeTrailingSemicolon('SELECT 1; -- note'), 'SELECT 1 -- note');
+  assert.equal(removeTrailingSemicolon("SELECT ';'"), "SELECT ';'");
+  assert.equal(removeTrailingSemicolon('SELECT 1 -- ;'), 'SELECT 1 -- ;');
+});
+
+test('auto LIMIT goes on its own line after a trailing comment', () => {
+  assert.deepEqual(applyAutoLimit('SELECT 1; -- note', CONFIG), { sql: 'SELECT 1 -- note\nLIMIT 100', limit: 100 });
+  assert.deepEqual(applyAutoLimit('SELECT 1 LIMIT 5 -- note', CONFIG), { sql: 'SELECT 1 LIMIT 5 -- note', limit: null });
+  assert.deepEqual(applyAutoLimit('SHOW server_version -- note', CONFIG), { sql: 'SHOW server_version -- note', limit: null });
+  assert.deepEqual(applyAutoLimit('SELECT 1', CONFIG, { limitOverride: 5 }), { sql: 'SELECT 1\nLIMIT 5', limit: 5 });
+  assert.deepEqual(applyAutoLimit('SELECT 1;', CONFIG, { autoLimit: false }), { sql: 'SELECT 1', limit: null });
+});
+
+test('buildExecution sends the read-only prelude separately from the user statement', () => {
+  const exec = buildExecution('SELECT 1;', CONFIG);
+  assert.equal(exec.prelude, 'BEGIN TRANSACTION READ ONLY; SET LOCAL statement_timeout = 10000');
+  assert.equal(exec.userSql, 'SELECT 1\nLIMIT 100');
+  assert.equal(exec.autoLimit, 100);
+  assert.equal(buildExecution('SELECT 1', { ...CONFIG, wrapInReadOnlyTx: false }).prelude, null);
 });
